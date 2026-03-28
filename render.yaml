@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: oms-orders-service
+    env: node
+    region: ohio
+    buildCommand: npm install
+    startCommand: node src/server.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3002
+      - key: DATABASE_URL
+        sync: false
