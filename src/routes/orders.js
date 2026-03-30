@@ -56,7 +56,7 @@ router.get('/dashboard', async (req, res, next) => {
          u.display_name AS changed_by_name
        FROM orders.order_status_log sl
        JOIN orders.orders o ON o.id = sl.order_id
-       LEFT JOIN app.users u ON u.id::text = sl.changed_by
+       LEFT JOIN app.users u ON u.id = (CASE WHEN sl.changed_by ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN sl.changed_by::uuid END)
        ORDER BY sl.changed_at DESC
        LIMIT 10`
     );
@@ -462,7 +462,7 @@ router.get('/:id', async (req, res, next) => {
          sl.changed_by,
          u.display_name AS changed_by_name
        FROM orders.order_status_log sl
-       LEFT JOIN app.users u ON u.id::text = sl.changed_by
+       LEFT JOIN app.users u ON u.id = (CASE WHEN sl.changed_by ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN sl.changed_by::uuid END)
        WHERE sl.order_id = $1
        ORDER BY sl.changed_at ASC`,
       [id]
