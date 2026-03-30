@@ -311,6 +311,7 @@ router.get('/', async (req, res, next) => {
 router.post('/', async (req, res, next) => {
   try {
     const {
+      external_id,
       customer_name,
       address_line1,
       address_line2,
@@ -368,13 +369,18 @@ router.post('/', async (req, res, next) => {
     try {
       await client.query('BEGIN');
 
+      // Only use created_by if it's a valid UUID (not 'system' or other synthetic IDs)
+      const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      const createdBy = UUID_RE.test(req.userId) ? req.userId : null;
+
       const orderResult = await client.query(
         `INSERT INTO orders.orders
-           (platform, customer_name, address_line1, address_line2,
+           (external_id, platform, customer_name, address_line1, address_line2,
             city, state, zip, country, status, notes, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'new', $9, $10)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'new', $10, $11)
          RETURNING *`,
         [
+          external_id || null,
           platform || 'manual',
           customer_name,
           address_line1,
@@ -384,7 +390,7 @@ router.post('/', async (req, res, next) => {
           zip,
           country || null,
           notes || null,
-          req.userId,
+          createdBy,
         ]
       );
       createdOrder = orderResult.rows[0];
