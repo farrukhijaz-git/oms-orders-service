@@ -277,8 +277,12 @@ router.get('/', async (req, res, next) => {
          o.external_id,
          o.platform,
          o.customer_name,
+         o.address_line1,
+         o.address_line2,
          o.city,
          o.state,
+         o.zip,
+         o.country,
          o.status,
          o.label_id,
          o.tracking_number,
@@ -558,6 +562,62 @@ router.patch('/:id/status', async (req, res, next) => {
     }
 
     res.json({ order: updatedOrder });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// PATCH /orders/:id - Update order label and tracking
+// ---------------------------------------------------------------------------
+router.patch('/:id', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { label_id, tracking_number } = req.body;
+
+    // At least one field must be provided
+    if (label_id === undefined && tracking_number === undefined) {
+      return res.status(400).json({
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: 'At least one of label_id or tracking_number must be provided',
+        },
+      });
+    }
+
+    // Build dynamic update query
+    const updates = [];
+    const params = [];
+    let paramIndex = 1;
+
+    if (label_id !== undefined) {
+      updates.push(`label_id = $${paramIndex}`);
+      params.push(label_id);
+      paramIndex++;
+    }
+
+    if (tracking_number !== undefined) {
+      updates.push(`tracking_number = $${paramIndex}`);
+      params.push(tracking_number);
+      paramIndex++;
+    }
+
+    updates.push(`updated_at = now()`);
+    params.push(id);
+
+    const updateQuery = `
+      UPDATE orders.orders
+      SET ${updates.join(', ')}
+      WHERE id = $${paramIndex}
+      RETURNING *`;
+
+    const result = await pool.query(updateQuery, params);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Order not found' } });
+    }
+
+    res.json({ order: result.rows[0] });
   } catch (err) {
     next(err);
   }
