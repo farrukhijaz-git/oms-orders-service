@@ -16,7 +16,7 @@ router.use(requireUser);
 const upload = multer({ storage: multer.memoryStorage() });
 
 // Valid enum values
-const VALID_STATUSES = ['new', 'label_generated', 'inventory_ordered', 'packed', 'ready', 'shipped'];
+const VALID_STATUSES = ['new', 'label_generated', 'inventory_ordered', 'packed', 'ready', 'shipped', 'delivered'];
 const VALID_PLATFORMS = ['walmart', 'ebay', 'amazon', 'manual'];
 
 // ---------------------------------------------------------------------------
@@ -37,6 +37,7 @@ router.get('/dashboard', async (req, res, next) => {
       packed: 0,
       ready: 0,
       shipped: 0,
+      delivered: 0,
     };
     for (const row of countsResult.rows) {
       counts[row.status] = row.count;
@@ -326,7 +327,14 @@ router.post('/', async (req, res, next) => {
       platform,
       items,
       notes,
+      status: providedStatus,
+      tracking_number,
     } = req.body;
+
+    // Allow callers (e.g. Walmart poller) to set initial status; default to 'new'
+    const initialStatus = (providedStatus && VALID_STATUSES.includes(providedStatus))
+      ? providedStatus
+      : 'new';
 
     // Validate required fields
     const missing = [];
@@ -376,8 +384,8 @@ router.post('/', async (req, res, next) => {
       const orderResult = await client.query(
         `INSERT INTO orders.orders
            (external_id, platform, customer_name, address_line1, address_line2,
-            city, state, zip, country, status, notes, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'new', $10, $11)
+            city, state, zip, country, status, tracking_number, notes, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
          RETURNING *`,
         [
           external_id || null,
@@ -389,6 +397,8 @@ router.post('/', async (req, res, next) => {
           state,
           zip,
           country || null,
+          initialStatus,
+          tracking_number || null,
           notes || null,
           req.userId,
         ]
@@ -411,8 +421,13 @@ router.post('/', async (req, res, next) => {
 
       await client.query(
         `INSERT INTO orders.order_status_log (order_id, from_status, to_status, changed_by, note)
-         VALUES ($1, NULL, 'new', $2, 'Order created')`,
-        [createdOrder.id, req.userId]
+         VALUES ($1, NULL, $2, $3, $4)`,
+        [
+          createdOrder.id,
+          initialStatus,
+          req.userId,
+          initialStatus === 'new' ? 'Order created' : `Order created (imported as ${initialStatus})`,
+        ]
       );
 
       await client.query('COMMIT');
