@@ -329,6 +329,11 @@ router.post('/', async (req, res, next) => {
       notes,
       status: providedStatus,
       tracking_number,
+      order_date,
+      ship_by_date,
+      deliver_by_date,
+      ship_node,
+      order_total,
     } = req.body;
 
     // Allow callers (e.g. Walmart poller) to set initial status; default to 'new'
@@ -384,8 +389,9 @@ router.post('/', async (req, res, next) => {
       const orderResult = await client.query(
         `INSERT INTO orders.orders
            (external_id, platform, customer_name, address_line1, address_line2,
-            city, state, zip, country, status, tracking_number, notes, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            city, state, zip, country, status, tracking_number, notes, created_by,
+            order_date, ship_by_date, deliver_by_date, ship_node, order_total)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
          RETURNING *`,
         [
           external_id || null,
@@ -401,6 +407,11 @@ router.post('/', async (req, res, next) => {
           tracking_number || null,
           notes || null,
           req.userId,
+          order_date || null,
+          ship_by_date || null,
+          deliver_by_date || null,
+          ship_node || null,
+          order_total || null,
         ]
       );
       createdOrder = orderResult.rows[0];
