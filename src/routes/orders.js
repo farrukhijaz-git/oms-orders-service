@@ -287,6 +287,11 @@ router.get('/', async (req, res, next) => {
          o.status,
          o.label_id,
          o.tracking_number,
+         o.order_date,
+         o.ship_by_date,
+         o.deliver_by_date,
+         o.ship_node,
+         o.order_total,
          o.created_at,
          o.updated_at,
          COUNT(oi.id)::int AS item_count
@@ -294,7 +299,7 @@ router.get('/', async (req, res, next) => {
        LEFT JOIN orders.order_items oi ON oi.order_id = o.id
        ${where}
        GROUP BY o.id
-       ORDER BY o.created_at DESC
+       ORDER BY COALESCE(o.order_date, o.created_at) DESC
        LIMIT $${limitParam} OFFSET $${offsetParam}`,
       params
     );
@@ -594,19 +599,27 @@ router.patch('/:id/status', async (req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
-// PATCH /orders/:id - Update order label and tracking
+// PATCH /orders/:id - Update order label, tracking, and metadata fields
 // ---------------------------------------------------------------------------
 router.patch('/:id', async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { label_id, tracking_number } = req.body;
+    const { label_id, tracking_number, order_date, ship_by_date, deliver_by_date, ship_node, order_total } = req.body;
 
     // At least one field must be provided
-    if (label_id === undefined && tracking_number === undefined) {
+    if (
+      label_id === undefined &&
+      tracking_number === undefined &&
+      order_date === undefined &&
+      ship_by_date === undefined &&
+      deliver_by_date === undefined &&
+      ship_node === undefined &&
+      order_total === undefined
+    ) {
       return res.status(400).json({
         error: {
           code: 'VALIDATION_ERROR',
-          message: 'At least one of label_id or tracking_number must be provided',
+          message: 'At least one field must be provided',
         },
       });
     }
@@ -625,6 +638,36 @@ router.patch('/:id', async (req, res, next) => {
     if (tracking_number !== undefined) {
       updates.push(`tracking_number = $${paramIndex}`);
       params.push(tracking_number);
+      paramIndex++;
+    }
+
+    if (order_date !== undefined) {
+      updates.push(`order_date = $${paramIndex}`);
+      params.push(order_date);
+      paramIndex++;
+    }
+
+    if (ship_by_date !== undefined) {
+      updates.push(`ship_by_date = $${paramIndex}`);
+      params.push(ship_by_date);
+      paramIndex++;
+    }
+
+    if (deliver_by_date !== undefined) {
+      updates.push(`deliver_by_date = $${paramIndex}`);
+      params.push(deliver_by_date);
+      paramIndex++;
+    }
+
+    if (ship_node !== undefined) {
+      updates.push(`ship_node = $${paramIndex}`);
+      params.push(ship_node);
+      paramIndex++;
+    }
+
+    if (order_total !== undefined) {
+      updates.push(`order_total = $${paramIndex}`);
+      params.push(order_total);
       paramIndex++;
     }
 
