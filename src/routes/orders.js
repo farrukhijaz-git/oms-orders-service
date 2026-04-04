@@ -208,12 +208,38 @@ router.post('/import/csv', upload.single('file'), async (req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /orders/by-external-id/:externalId
+// Used internally by other services (e.g. Walmart poller) to look up an order
+// by its marketplace ID without requiring direct DB access to orders schema.
+// ---------------------------------------------------------------------------
+router.get('/by-external-id/:externalId', async (req, res, next) => {
+  try {
+    const { externalId } = req.params;
+    const result = await pool.query(
+      `SELECT id, status, tracking_number, order_date, ship_by_date,
+              deliver_by_date, ship_node, order_total, ship_node_id,
+              walmart_status, total_tax, customer_order_id, customer_email,
+              phone, address_type, shipping_method
+       FROM orders.orders WHERE external_id = $1 LIMIT 1`,
+      [externalId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ order: null });
+    }
+    res.json({ order: result.rows[0] });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // GET /orders - List with filtering and pagination
 // ---------------------------------------------------------------------------
 router.get('/', async (req, res, next) => {
   try {
     const {
       status,
+      walmart_status,
       platform,
       search,
       date_from,
@@ -234,6 +260,14 @@ router.get('/', async (req, res, next) => {
       if (statuses.length > 0) {
         params.push(statuses);
         conditions.push(`o.status = ANY($${params.length})`);
+      }
+    }
+
+    if (walmart_status) {
+      const wStatuses = walmart_status.split(',').map((s) => s.trim()).filter(Boolean);
+      if (wStatuses.length > 0) {
+        params.push(wStatuses);
+        conditions.push(`o.walmart_status = ANY($${params.length})`);
       }
     }
 
@@ -285,13 +319,18 @@ router.get('/', async (req, res, next) => {
          o.zip,
          o.country,
          o.status,
+         o.walmart_status,
          o.label_id,
          o.tracking_number,
          o.order_date,
          o.ship_by_date,
          o.deliver_by_date,
          o.ship_node,
+         o.ship_node_id,
          o.order_total,
+         o.total_tax,
+         o.customer_order_id,
+         o.customer_email,
          o.created_at,
          o.updated_at,
          COUNT(oi.id)::int AS item_count
@@ -338,7 +377,17 @@ router.post('/', async (req, res, next) => {
       ship_by_date,
       deliver_by_date,
       ship_node,
+      ship_node_id,
       order_total,
+      total_tax,
+      walmart_status,
+      customer_order_id,
+      customer_email,
+      phone,
+      address_type,
+      shipping_method,
+      carrier_method,
+      ship_method,
     } = req.body;
 
     // Allow callers (e.g. Walmart poller) to set initial status; default to 'new'
@@ -395,8 +444,12 @@ router.post('/', async (req, res, next) => {
         `INSERT INTO orders.orders
            (external_id, platform, customer_name, address_line1, address_line2,
             city, state, zip, country, status, tracking_number, notes, created_by,
-            order_date, ship_by_date, deliver_by_date, ship_node, order_total)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+            order_date, ship_by_date, deliver_by_date, ship_node, ship_node_id,
+            order_total, total_tax, walmart_status, customer_order_id, customer_email,
+            phone, address_type, shipping_method, carrier_method, ship_method)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                 $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)
+         ON CONFLICT (platform, external_id) DO NOTHING
          RETURNING *`,
         [
           external_id || null,
@@ -416,21 +469,48 @@ router.post('/', async (req, res, next) => {
           ship_by_date || null,
           deliver_by_date || null,
           ship_node || null,
+          ship_node_id || null,
           order_total || null,
+          total_tax || null,
+          walmart_status || null,
+          customer_order_id || null,
+          customer_email || null,
+          phone || null,
+          address_type || null,
+          shipping_method || null,
+          carrier_method || null,
+          ship_method || null,
         ]
       );
+      // ON CONFLICT DO NOTHING returns zero rows if external_id already exists
+      if (orderResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        client.release();
+        return res.status(409).json({
+          error: { code: 'DUPLICATE', message: `Order with external_id '${external_id}' on platform '${platform}' already exists` },
+        });
+      }
       createdOrder = orderResult.rows[0];
 
       for (const item of items) {
         await client.query(
-          `INSERT INTO orders.order_items (order_id, sku, name, quantity, unit_price)
-           VALUES ($1, $2, $3, $4, $5)`,
+          `INSERT INTO orders.order_items
+             (order_id, sku, name, quantity, unit_price, line_number, condition,
+              tax_amount, line_tracking_number, tracking_url, ship_datetime, line_status)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
           [
             createdOrder.id,
             item.sku || null,
             item.name,
             item.quantity || 1,
             item.unit_price || 0,
+            item.line_number || null,
+            item.condition || null,
+            item.tax_amount || null,
+            item.line_tracking_number || null,
+            item.tracking_url || null,
+            item.ship_datetime || null,
+            item.line_status || null,
           ]
         );
       }
@@ -604,7 +684,12 @@ router.patch('/:id/status', async (req, res, next) => {
 router.patch('/:id', async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { label_id, tracking_number, order_date, ship_by_date, deliver_by_date, ship_node, order_total } = req.body;
+    const {
+      label_id, tracking_number, order_date, ship_by_date, deliver_by_date,
+      ship_node, ship_node_id, order_total, total_tax, walmart_status,
+      customer_order_id, customer_email, phone, address_type,
+      shipping_method, carrier_method, ship_method,
+    } = req.body;
 
     // At least one field must be provided
     if (
@@ -614,7 +699,17 @@ router.patch('/:id', async (req, res, next) => {
       ship_by_date === undefined &&
       deliver_by_date === undefined &&
       ship_node === undefined &&
-      order_total === undefined
+      ship_node_id === undefined &&
+      order_total === undefined &&
+      total_tax === undefined &&
+      walmart_status === undefined &&
+      customer_order_id === undefined &&
+      customer_email === undefined &&
+      phone === undefined &&
+      address_type === undefined &&
+      shipping_method === undefined &&
+      carrier_method === undefined &&
+      ship_method === undefined
     ) {
       return res.status(400).json({
         error: {
@@ -668,6 +763,66 @@ router.patch('/:id', async (req, res, next) => {
     if (order_total !== undefined) {
       updates.push(`order_total = $${paramIndex}`);
       params.push(order_total);
+      paramIndex++;
+    }
+
+    if (ship_node_id !== undefined) {
+      updates.push(`ship_node_id = $${paramIndex}`);
+      params.push(ship_node_id);
+      paramIndex++;
+    }
+
+    if (total_tax !== undefined) {
+      updates.push(`total_tax = $${paramIndex}`);
+      params.push(total_tax);
+      paramIndex++;
+    }
+
+    if (walmart_status !== undefined) {
+      updates.push(`walmart_status = $${paramIndex}`);
+      params.push(walmart_status);
+      paramIndex++;
+    }
+
+    if (customer_order_id !== undefined) {
+      updates.push(`customer_order_id = $${paramIndex}`);
+      params.push(customer_order_id);
+      paramIndex++;
+    }
+
+    if (customer_email !== undefined) {
+      updates.push(`customer_email = $${paramIndex}`);
+      params.push(customer_email);
+      paramIndex++;
+    }
+
+    if (phone !== undefined) {
+      updates.push(`phone = $${paramIndex}`);
+      params.push(phone);
+      paramIndex++;
+    }
+
+    if (address_type !== undefined) {
+      updates.push(`address_type = $${paramIndex}`);
+      params.push(address_type);
+      paramIndex++;
+    }
+
+    if (shipping_method !== undefined) {
+      updates.push(`shipping_method = $${paramIndex}`);
+      params.push(shipping_method);
+      paramIndex++;
+    }
+
+    if (carrier_method !== undefined) {
+      updates.push(`carrier_method = $${paramIndex}`);
+      params.push(carrier_method);
+      paramIndex++;
+    }
+
+    if (ship_method !== undefined) {
+      updates.push(`ship_method = $${paramIndex}`);
+      params.push(ship_method);
       paramIndex++;
     }
 
