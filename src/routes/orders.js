@@ -285,16 +285,15 @@ router.get('/', async (req, res, next) => {
     }
 
     if (date_from) {
-      params.push(date_from);
-      conditions.push(`COALESCE(o.order_date, o.created_at) >= $${params.length}`);
+      const dateFromStart = date_from.length === 10 ? `${date_from}T00:00:00.000Z` : date_from;
+      params.push(dateFromStart);
+      conditions.push(`COALESCE(o.order_date, o.created_at) >= $${params.length}::timestamptz`);
     }
 
     if (date_to) {
-      // HTML date inputs send 'YYYY-MM-DD' which PostgreSQL casts to midnight,
-      // cutting off the rest of that day. Append end-of-day time.
       const dateToEnd = date_to.length === 10 ? `${date_to}T23:59:59.999Z` : date_to;
       params.push(dateToEnd);
-      conditions.push(`COALESCE(o.order_date, o.created_at) <= $${params.length}`);
+      conditions.push(`COALESCE(o.order_date, o.created_at) <= $${params.length}::timestamptz`);
     }
 
     if (ship_node) {
@@ -303,14 +302,15 @@ router.get('/', async (req, res, next) => {
     }
 
     if (ship_by_from) {
-      params.push(ship_by_from);
-      conditions.push(`o.ship_by_date >= $${params.length}`);
+      const shipByFromStart = ship_by_from.length === 10 ? `${ship_by_from}T00:00:00.000Z` : ship_by_from;
+      params.push(shipByFromStart);
+      conditions.push(`o.ship_by_date >= $${params.length}::timestamptz`);
     }
 
     if (ship_by_to) {
       const shipByToEnd = ship_by_to.length === 10 ? `${ship_by_to}T23:59:59.999Z` : ship_by_to;
       params.push(shipByToEnd);
-      conditions.push(`o.ship_by_date <= $${params.length}`);
+      conditions.push(`o.ship_by_date <= $${params.length}::timestamptz`);
     }
 
     const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
