@@ -244,6 +244,9 @@ router.get('/', async (req, res, next) => {
       search,
       date_from,
       date_to,
+      ship_node,
+      ship_by_from,
+      ship_by_to,
       page = 1,
       limit = 20,
     } = req.query;
@@ -283,12 +286,27 @@ router.get('/', async (req, res, next) => {
 
     if (date_from) {
       params.push(date_from);
-      conditions.push(`o.created_at >= $${params.length}`);
+      conditions.push(`COALESCE(o.order_date, o.created_at) >= $${params.length}`);
     }
 
     if (date_to) {
       params.push(date_to);
-      conditions.push(`o.created_at <= $${params.length}`);
+      conditions.push(`COALESCE(o.order_date, o.created_at) <= $${params.length}`);
+    }
+
+    if (ship_node) {
+      params.push(`%${ship_node.trim()}%`);
+      conditions.push(`o.ship_node ILIKE $${params.length}`);
+    }
+
+    if (ship_by_from) {
+      params.push(ship_by_from);
+      conditions.push(`o.ship_by_date >= $${params.length}`);
+    }
+
+    if (ship_by_to) {
+      params.push(ship_by_to);
+      conditions.push(`o.ship_by_date <= $${params.length}`);
     }
 
     const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
