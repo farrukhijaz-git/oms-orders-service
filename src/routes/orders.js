@@ -16,7 +16,7 @@ router.use(requireUser);
 const upload = multer({ storage: multer.memoryStorage() });
 
 // Valid enum values
-const VALID_STATUSES = ['new', 'label_generated', 'inventory_ordered', 'packed', 'ready', 'shipped', 'delivered'];
+const VALID_STATUSES = ['new', 'label_generated', 'inventory_ordered', 'packed', 'ready', 'shipped', 'delivered', 'cancelled'];
 const VALID_PLATFORMS = ['walmart', 'ebay', 'amazon', 'manual'];
 
 // ---------------------------------------------------------------------------
