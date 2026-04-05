@@ -290,7 +290,10 @@ router.get('/', async (req, res, next) => {
     }
 
     if (date_to) {
-      params.push(date_to);
+      // HTML date inputs send 'YYYY-MM-DD' which PostgreSQL casts to midnight,
+      // cutting off the rest of that day. Append end-of-day time.
+      const dateToEnd = date_to.length === 10 ? `${date_to}T23:59:59.999Z` : date_to;
+      params.push(dateToEnd);
       conditions.push(`COALESCE(o.order_date, o.created_at) <= $${params.length}`);
     }
 
@@ -305,7 +308,8 @@ router.get('/', async (req, res, next) => {
     }
 
     if (ship_by_to) {
-      params.push(ship_by_to);
+      const shipByToEnd = ship_by_to.length === 10 ? `${ship_by_to}T23:59:59.999Z` : ship_by_to;
+      params.push(shipByToEnd);
       conditions.push(`o.ship_by_date <= $${params.length}`);
     }
 
