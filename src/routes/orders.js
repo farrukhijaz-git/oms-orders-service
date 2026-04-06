@@ -349,6 +349,7 @@ router.get('/', async (req, res, next) => {
          o.total_tax,
          o.customer_order_id,
          o.customer_email,
+         o.tracking_pushed_to_walmart,
          o.created_at,
          o.updated_at,
          COUNT(oi.id)::int AS item_count
@@ -706,7 +707,7 @@ router.patch('/:id', async (req, res, next) => {
       label_id, tracking_number, order_date, ship_by_date, deliver_by_date,
       ship_node, ship_node_id, order_total, total_tax, walmart_status,
       customer_order_id, customer_email, phone, address_type,
-      shipping_method, carrier_method, ship_method,
+      shipping_method, carrier_method, ship_method, tracking_pushed_to_walmart,
     } = req.body;
 
     // At least one field must be provided
@@ -727,7 +728,8 @@ router.patch('/:id', async (req, res, next) => {
       address_type === undefined &&
       shipping_method === undefined &&
       carrier_method === undefined &&
-      ship_method === undefined
+      ship_method === undefined &&
+      tracking_pushed_to_walmart === undefined
     ) {
       return res.status(400).json({
         error: {
@@ -841,6 +843,12 @@ router.patch('/:id', async (req, res, next) => {
     if (ship_method !== undefined) {
       updates.push(`ship_method = $${paramIndex}`);
       params.push(ship_method);
+      paramIndex++;
+    }
+
+    if (tracking_pushed_to_walmart !== undefined) {
+      updates.push(`tracking_pushed_to_walmart = $${paramIndex}`);
+      params.push(tracking_pushed_to_walmart);
       paramIndex++;
     }
 
