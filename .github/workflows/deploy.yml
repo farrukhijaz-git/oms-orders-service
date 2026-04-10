@@ -1,0 +1,23 @@
+name: Deploy to Oracle VM
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          port: ${{ secrets.VM_SSH_PORT }}
+          script: |
+            cd ~/oms/oms-orders-service
+            git pull origin main
+            cd ~/oms
+            docker compose up --build -d --no-deps oms-orders-service
+            docker image prune -f
