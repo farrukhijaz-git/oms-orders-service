@@ -271,6 +271,10 @@ router.get('/', async (req, res, next) => {
       ship_node,
       ship_by_from,
       ship_by_to,
+      deliver_by_from,
+      deliver_by_to,
+      sort_by,
+      sort_dir,
       page = 1,
       limit = 20,
     } = req.query;
@@ -333,7 +337,28 @@ router.get('/', async (req, res, next) => {
       conditions.push(`o.ship_by_date <= $${params.length}`);
     }
 
+    if (deliver_by_from) {
+      params.push(deliver_by_from);
+      conditions.push(`o.deliver_by_date >= $${params.length}`);
+    }
+
+    if (deliver_by_to) {
+      params.push(deliver_by_to);
+      conditions.push(`o.deliver_by_date <= $${params.length}`);
+    }
+
     const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const SORT_COLUMNS = {
+      order_date:     `COALESCE(o.order_date, o.created_at)`,
+      ship_by_date:   `o.ship_by_date`,
+      deliver_by_date:`o.deliver_by_date`,
+      order_total:    `o.order_total`,
+      customer_name:  `o.customer_name`,
+    };
+    const sortCol = SORT_COLUMNS[sort_by] || `COALESCE(o.order_date, o.created_at)`;
+    const sortDir = sort_dir === 'asc' ? 'ASC' : 'DESC';
+    const orderBy = `${sortCol} ${sortDir} NULLS LAST`;
 
     // Count query
     const countResult = await pool.query(
@@ -381,7 +406,7 @@ router.get('/', async (req, res, next) => {
        LEFT JOIN orders.order_items oi ON oi.order_id = o.id
        ${where}
        GROUP BY o.id
-       ORDER BY COALESCE(o.order_date, o.created_at) DESC
+       ORDER BY ${orderBy}
        LIMIT $${limitParam} OFFSET $${offsetParam}`,
       params
     );
