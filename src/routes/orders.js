@@ -62,7 +62,31 @@ router.get('/dashboard', async (req, res, next) => {
        LIMIT 10`
     );
 
-    res.json({ counts, recent_activity: activityResult.rows });
+    // At-risk orders: ship_by or deliver_by within 7 days and not yet at the required status
+    const atRiskResult = await pool.query(
+      `SELECT
+         id, external_id, customer_name, status, platform,
+         ship_by_date, deliver_by_date
+       FROM orders.orders
+       WHERE status NOT IN ('cancelled')
+         AND (
+           (ship_by_date IS NOT NULL
+            AND ship_by_date <= NOW() + INTERVAL '7 days'
+            AND status NOT IN ('shipped', 'delivered'))
+           OR
+           (deliver_by_date IS NOT NULL
+            AND deliver_by_date <= NOW() + INTERVAL '7 days'
+            AND status NOT IN ('delivered'))
+         )
+       ORDER BY
+         LEAST(
+           CASE WHEN status NOT IN ('shipped','delivered') THEN ship_by_date ELSE NULL END,
+           CASE WHEN status NOT IN ('delivered') THEN deliver_by_date ELSE NULL END
+         ) ASC NULLS LAST
+       LIMIT 20`
+    );
+
+    res.json({ counts, recent_activity: activityResult.rows, at_risk_orders: atRiskResult.rows });
   } catch (err) {
     next(err);
   }
