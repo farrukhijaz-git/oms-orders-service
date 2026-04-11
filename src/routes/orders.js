@@ -257,6 +257,381 @@ router.get('/by-external-id/:externalId', async (req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /orders/reports/shipment-performance
+// Summary metrics: on-time rate, late count, overdue count, avg days late.
+// Optionally broken down by week, platform, or ship_node via group_by param.
+// Only orders with a ship_by_date are included (no deadline = not measurable).
+// ---------------------------------------------------------------------------
+router.get('/reports/shipment-performance', async (req, res, next) => {
+  try {
+    const {
+      date_from,
+      date_to,
+      date_field = 'ship_by_date',
+      platform,
+      ship_node,
+      group_by,
+    } = req.query;
+
+    const VALID_DATE_FIELDS = ['ship_by_date', 'order_date'];
+    const VALID_GROUP_BY = ['week', 'platform', 'ship_node'];
+    const dateCol = VALID_DATE_FIELDS.includes(date_field) ? date_field : 'ship_by_date';
+
+    const conditions = [
+      `o.ship_by_date IS NOT NULL`,
+      `o.status != 'cancelled'`,
+    ];
+    const params = [];
+
+    if (date_from) {
+      params.push(date_from);
+      conditions.push(`o.${dateCol} >= $${params.length}`);
+    }
+    if (date_to) {
+      params.push(date_to);
+      conditions.push(`o.${dateCol} <= $${params.length}`);
+    }
+    if (platform) {
+      const platforms = platform.split(',').map((s) => s.trim()).filter(Boolean);
+      if (platforms.length > 0) {
+        params.push(platforms);
+        conditions.push(`o.platform = ANY($${params.length})`);
+      }
+    }
+    if (ship_node) {
+      params.push(`%${ship_node.trim()}%`);
+      conditions.push(`o.ship_node ILIKE $${params.length}`);
+    }
+
+    const where = conditions.join(' AND ');
+
+    // Summary — one row of aggregate metrics
+    const summaryResult = await pool.query(
+      `WITH per_order AS (
+         SELECT
+           o.id,
+           o.ship_by_date,
+           o.status,
+           MIN(sl.changed_at) AS shipped_at
+         FROM orders.orders o
+         LEFT JOIN orders.order_status_log sl
+           ON sl.order_id = o.id AND sl.to_status = 'shipped'
+         WHERE ${where}
+         GROUP BY o.id, o.ship_by_date, o.status
+       )
+       SELECT
+         COUNT(*)::int AS total,
+         COUNT(*) FILTER (
+           WHERE shipped_at IS NOT NULL AND shipped_at <= ship_by_date
+         )::int AS on_time,
+         COUNT(*) FILTER (
+           WHERE shipped_at IS NOT NULL AND shipped_at > ship_by_date
+         )::int AS late,
+         COUNT(*) FILTER (
+           WHERE shipped_at IS NULL
+             AND ship_by_date < NOW()
+             AND status NOT IN ('shipped', 'delivered')
+         )::int AS overdue,
+         ROUND(
+           CASE
+             WHEN COUNT(*) FILTER (WHERE shipped_at IS NOT NULL) > 0
+             THEN COUNT(*) FILTER (
+               WHERE shipped_at IS NOT NULL AND shipped_at <= ship_by_date
+             )::numeric * 100.0
+                  / COUNT(*) FILTER (WHERE shipped_at IS NOT NULL)
+             ELSE NULL
+           END, 1
+         ) AS on_time_rate,
+         ROUND(
+           AVG(
+             CASE
+               WHEN shipped_at IS NOT NULL AND shipped_at > ship_by_date
+               THEN EXTRACT(EPOCH FROM (shipped_at - ship_by_date)) / 86400
+             END
+           )::numeric, 1
+         ) AS avg_days_late
+       FROM per_order`,
+      params
+    );
+
+    const summary = summaryResult.rows[0];
+
+    // Grouped breakdown (optional)
+    let groups = null;
+    if (group_by && VALID_GROUP_BY.includes(group_by)) {
+      let groupKeyExpr;
+      if (group_by === 'week') {
+        groupKeyExpr = `DATE_TRUNC('week', ship_by_date)`;
+      } else if (group_by === 'platform') {
+        groupKeyExpr = `platform`;
+      } else {
+        groupKeyExpr = `ship_node`;
+      }
+
+      const groupResult = await pool.query(
+        `WITH per_order AS (
+           SELECT
+             o.id,
+             o.ship_by_date,
+             o.status,
+             o.platform,
+             COALESCE(o.ship_node, 'Unknown') AS ship_node,
+             MIN(sl.changed_at) AS shipped_at
+           FROM orders.orders o
+           LEFT JOIN orders.order_status_log sl
+             ON sl.order_id = o.id AND sl.to_status = 'shipped'
+           WHERE ${where}
+           GROUP BY o.id, o.ship_by_date, o.status, o.platform, o.ship_node
+         )
+         SELECT
+           ${groupKeyExpr} AS group_key,
+           COUNT(*)::int AS total,
+           COUNT(*) FILTER (
+             WHERE shipped_at IS NOT NULL AND shipped_at <= ship_by_date
+           )::int AS on_time,
+           COUNT(*) FILTER (
+             WHERE shipped_at IS NOT NULL AND shipped_at > ship_by_date
+           )::int AS late,
+           COUNT(*) FILTER (
+             WHERE shipped_at IS NULL
+               AND ship_by_date < NOW()
+               AND status NOT IN ('shipped', 'delivered')
+           )::int AS overdue,
+           ROUND(
+             CASE
+               WHEN COUNT(*) FILTER (WHERE shipped_at IS NOT NULL) > 0
+               THEN COUNT(*) FILTER (
+                 WHERE shipped_at IS NOT NULL AND shipped_at <= ship_by_date
+               )::numeric * 100.0
+                    / COUNT(*) FILTER (WHERE shipped_at IS NOT NULL)
+               ELSE NULL
+             END, 1
+           ) AS on_time_rate,
+           ROUND(
+             AVG(
+               CASE
+                 WHEN shipped_at IS NOT NULL AND shipped_at > ship_by_date
+                 THEN EXTRACT(EPOCH FROM (shipped_at - ship_by_date)) / 86400
+               END
+             )::numeric, 1
+           ) AS avg_days_late
+         FROM per_order
+         GROUP BY ${groupKeyExpr}
+         ORDER BY group_key`,
+        params
+      );
+
+      groups = groupResult.rows;
+    }
+
+    res.json({ summary, groups });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /orders/reports/late-shipments
+// Paginated list of orders shipped late or currently overdue.
+// status param: 'late' | 'overdue' | 'all' (default)
+// ---------------------------------------------------------------------------
+router.get('/reports/late-shipments', async (req, res, next) => {
+  try {
+    const {
+      date_from,
+      date_to,
+      platform,
+      status = 'all',
+      page = 1,
+      limit = 20,
+    } = req.query;
+
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+    const offset = (pageNum - 1) * limitNum;
+
+    const conditions = [
+      `o.ship_by_date IS NOT NULL`,
+      `o.status != 'cancelled'`,
+    ];
+    const params = [];
+
+    if (date_from) {
+      params.push(date_from);
+      conditions.push(`o.ship_by_date >= $${params.length}`);
+    }
+    if (date_to) {
+      params.push(date_to);
+      conditions.push(`o.ship_by_date <= $${params.length}`);
+    }
+    if (platform) {
+      const platforms = platform.split(',').map((s) => s.trim()).filter(Boolean);
+      if (platforms.length > 0) {
+        params.push(platforms);
+        conditions.push(`o.platform = ANY($${params.length})`);
+      }
+    }
+
+    const where = conditions.join(' AND ');
+
+    let filterCondition;
+    if (status === 'late') {
+      filterCondition = `shipped_at IS NOT NULL AND shipped_at > ship_by_date`;
+    } else if (status === 'overdue') {
+      filterCondition = `shipped_at IS NULL AND ship_by_date < NOW() AND current_status NOT IN ('shipped', 'delivered')`;
+    } else {
+      filterCondition = `(shipped_at IS NOT NULL AND shipped_at > ship_by_date)
+        OR (shipped_at IS NULL AND ship_by_date < NOW() AND current_status NOT IN ('shipped', 'delivered'))`;
+    }
+
+    const cte = `
+      WITH per_order AS (
+        SELECT
+          o.id,
+          o.external_id,
+          o.platform,
+          o.customer_name,
+          o.ship_by_date,
+          o.ship_node,
+          o.status AS current_status,
+          MIN(sl.changed_at) AS shipped_at
+        FROM orders.orders o
+        LEFT JOIN orders.order_status_log sl
+          ON sl.order_id = o.id AND sl.to_status = 'shipped'
+        WHERE ${where}
+        GROUP BY o.id, o.external_id, o.platform, o.customer_name,
+                 o.ship_by_date, o.ship_node, o.status
+      )`;
+
+    const countResult = await pool.query(
+      `${cte}
+       SELECT COUNT(*)::int AS total FROM per_order WHERE ${filterCondition}`,
+      params
+    );
+    const total = countResult.rows[0].total;
+
+    params.push(limitNum);
+    const limitParam = params.length;
+    params.push(offset);
+    const offsetParam = params.length;
+
+    const dataResult = await pool.query(
+      `${cte}
+       SELECT
+         id,
+         external_id,
+         platform,
+         customer_name,
+         ship_by_date,
+         shipped_at,
+         ship_node,
+         current_status,
+         CASE
+           WHEN shipped_at IS NOT NULL AND shipped_at > ship_by_date
+           THEN ROUND(EXTRACT(EPOCH FROM (shipped_at - ship_by_date)) / 86400, 1)
+           WHEN shipped_at IS NULL AND ship_by_date < NOW()
+           THEN ROUND(EXTRACT(EPOCH FROM (NOW() - ship_by_date)) / 86400, 1)
+         END AS days_late
+       FROM per_order
+       WHERE ${filterCondition}
+       ORDER BY ship_by_date ASC
+       LIMIT $${limitParam} OFFSET $${offsetParam}`,
+      params
+    );
+
+    res.json({
+      orders: dataResult.rows,
+      total,
+      page: pageNum,
+      limit: limitNum,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /orders/reports/overdue
+// Orders past their ship_by_date that have not yet shipped.
+// Always reflects current state — no date range filter needed.
+// sort_dir: 'desc' = most overdue first (default), 'asc' = least overdue first
+// ---------------------------------------------------------------------------
+router.get('/reports/overdue', async (req, res, next) => {
+  try {
+    const {
+      platform,
+      ship_node,
+      sort_dir = 'desc',
+      page = 1,
+      limit = 50,
+    } = req.query;
+
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(200, Math.max(1, parseInt(limit, 10) || 50));
+    const offset = (pageNum - 1) * limitNum;
+
+    const conditions = [
+      `o.ship_by_date < NOW()`,
+      `o.status NOT IN ('shipped', 'delivered', 'cancelled')`,
+    ];
+    const params = [];
+
+    if (platform) {
+      const platforms = platform.split(',').map((s) => s.trim()).filter(Boolean);
+      if (platforms.length > 0) {
+        params.push(platforms);
+        conditions.push(`o.platform = ANY($${params.length})`);
+      }
+    }
+    if (ship_node) {
+      params.push(`%${ship_node.trim()}%`);
+      conditions.push(`o.ship_node ILIKE $${params.length}`);
+    }
+
+    const where = conditions.join(' AND ');
+    // sort_dir='desc' = most overdue first = oldest ship_by_date first = ORDER BY ASC
+    const orderClause = sort_dir === 'asc' ? 'o.ship_by_date DESC' : 'o.ship_by_date ASC';
+
+    const countResult = await pool.query(
+      `SELECT COUNT(*)::int AS total FROM orders.orders o WHERE ${where}`,
+      params
+    );
+    const total = countResult.rows[0].total;
+
+    params.push(limitNum);
+    const limitParam = params.length;
+    params.push(offset);
+    const offsetParam = params.length;
+
+    const dataResult = await pool.query(
+      `SELECT
+         o.id,
+         o.external_id,
+         o.platform,
+         o.customer_name,
+         o.ship_by_date,
+         o.ship_node,
+         o.status,
+         ROUND(EXTRACT(EPOCH FROM (NOW() - o.ship_by_date)) / 86400, 1) AS days_overdue
+       FROM orders.orders o
+       WHERE ${where}
+       ORDER BY ${orderClause}
+       LIMIT $${limitParam} OFFSET $${offsetParam}`,
+      params
+    );
+
+    res.json({
+      orders: dataResult.rows,
+      total,
+      page: pageNum,
+      limit: limitNum,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // GET /orders - List with filtering and pagination
 // ---------------------------------------------------------------------------
 router.get('/', async (req, res, next) => {
@@ -609,6 +984,270 @@ router.post('/', async (req, res, next) => {
     );
 
     res.status(201).json({ order: { ...createdOrder, items: itemsResult.rows } });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /orders/reports/shipment-performance
+// Accepts: date_from, date_to (filter on ship_by_date), platform (comma-sep),
+//          ship_node, group_by (week|platform|ship_node)
+// ---------------------------------------------------------------------------
+router.get('/reports/shipment-performance', async (req, res, next) => {
+  try {
+    const { date_from, date_to, platform, ship_node, group_by } = req.query;
+
+    const conditions = [];
+    const params = [];
+
+    if (date_from) {
+      params.push(date_from);
+      conditions.push(`o.ship_by_date >= $${params.length}`);
+    }
+    if (date_to) {
+      params.push(date_to);
+      conditions.push(`o.ship_by_date <= $${params.length}`);
+    }
+    if (platform) {
+      const platforms = platform.split(',').map((s) => s.trim()).filter(Boolean);
+      if (platforms.length > 0) {
+        params.push(platforms);
+        conditions.push(`o.platform = ANY($${params.length})`);
+      }
+    }
+    if (ship_node) {
+      params.push(`%${ship_node.trim()}%`);
+      conditions.push(`o.ship_node ILIKE $${params.length}`);
+    }
+
+    const extraWhere = conditions.length > 0 ? `AND ${conditions.join(' AND ')}` : '';
+
+    const VALID_GROUP_BY = ['week', 'platform', 'ship_node'];
+    const groupByKey = VALID_GROUP_BY.includes(group_by) ? group_by : null;
+
+    let groupSelect = '';
+    let groupByClause = '';
+    let orderByClause = '';
+    if (groupByKey === 'week') {
+      groupSelect = `TO_CHAR(DATE_TRUNC('week', effective_date), 'YYYY-MM-DD') AS group_key,`;
+      groupByClause = `GROUP BY DATE_TRUNC('week', effective_date)`;
+      orderByClause = `ORDER BY DATE_TRUNC('week', effective_date)`;
+    } else if (groupByKey === 'platform') {
+      groupSelect = `platform AS group_key,`;
+      groupByClause = `GROUP BY platform`;
+      orderByClause = `ORDER BY platform`;
+    } else if (groupByKey === 'ship_node') {
+      groupSelect = `COALESCE(ship_node, 'Unknown') AS group_key,`;
+      groupByClause = `GROUP BY ship_node`;
+      orderByClause = `ORDER BY COALESCE(ship_node, 'Unknown')`;
+    }
+
+    const query = `
+      WITH shipped_log AS (
+        SELECT DISTINCT ON (order_id) order_id, changed_at AS shipped_at
+        FROM orders.order_status_log
+        WHERE to_status = 'shipped'
+        ORDER BY order_id, changed_at ASC
+      ),
+      base AS (
+        SELECT
+          o.platform,
+          o.ship_node,
+          COALESCE(o.order_date, o.created_at) AS effective_date,
+          o.ship_by_date,
+          sl.shipped_at,
+          CASE
+            WHEN sl.shipped_at IS NOT NULL AND sl.shipped_at <= o.ship_by_date THEN 'on_time'
+            WHEN sl.shipped_at IS NOT NULL AND sl.shipped_at > o.ship_by_date THEN 'late'
+            WHEN sl.shipped_at IS NULL AND o.ship_by_date < NOW()
+                 AND o.status NOT IN ('shipped', 'delivered', 'cancelled') THEN 'overdue'
+            ELSE 'pending'
+          END AS perf_status,
+          CASE
+            WHEN sl.shipped_at IS NOT NULL AND sl.shipped_at > o.ship_by_date
+            THEN EXTRACT(EPOCH FROM (sl.shipped_at - o.ship_by_date)) / 86400.0
+            ELSE NULL
+          END AS days_late
+        FROM orders.orders o
+        LEFT JOIN shipped_log sl ON sl.order_id = o.id
+        WHERE o.ship_by_date IS NOT NULL
+          ${extraWhere}
+      )
+      SELECT
+        ${groupSelect}
+        COUNT(*)::int AS total,
+        SUM(CASE WHEN perf_status = 'on_time' THEN 1 ELSE 0 END)::int AS on_time,
+        SUM(CASE WHEN perf_status = 'late' THEN 1 ELSE 0 END)::int AS late,
+        SUM(CASE WHEN perf_status = 'overdue' THEN 1 ELSE 0 END)::int AS overdue,
+        ROUND(
+          CASE WHEN SUM(CASE WHEN perf_status IN ('on_time', 'late') THEN 1 ELSE 0 END) > 0
+          THEN SUM(CASE WHEN perf_status = 'on_time' THEN 1 ELSE 0 END)::numeric * 100.0
+               / SUM(CASE WHEN perf_status IN ('on_time', 'late') THEN 1 ELSE 0 END)
+          ELSE NULL END, 1
+        ) AS on_time_rate,
+        ROUND(AVG(days_late)::numeric, 1) AS avg_days_late
+      FROM base
+      ${groupByClause}
+      ${orderByClause}
+    `;
+
+    const result = await pool.query(query, params);
+
+    if (groupByKey) {
+      res.json({ groups: result.rows });
+    } else {
+      const row = result.rows[0] || {};
+      res.json({
+        summary: {
+          total: row.total || 0,
+          on_time: row.on_time || 0,
+          late: row.late || 0,
+          overdue: row.overdue || 0,
+          on_time_rate: row.on_time_rate != null ? parseFloat(row.on_time_rate) : null,
+          avg_days_late: row.avg_days_late != null ? parseFloat(row.avg_days_late) : null,
+        },
+      });
+    }
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /orders/reports/late-shipments
+// Accepts: date_from, date_to (filter on ship_by_date), platform (comma-sep),
+//          status (late|overdue|all, default all), page, limit
+// ---------------------------------------------------------------------------
+router.get('/reports/late-shipments', async (req, res, next) => {
+  try {
+    const {
+      date_from, date_to, platform,
+      status = 'all',
+      page = 1,
+      limit = 20,
+    } = req.query;
+
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+    const offset = (pageNum - 1) * limitNum;
+
+    const conditions = [];
+    const params = [];
+
+    if (date_from) {
+      params.push(date_from);
+      conditions.push(`o.ship_by_date >= $${params.length}`);
+    }
+    if (date_to) {
+      params.push(date_to);
+      conditions.push(`o.ship_by_date <= $${params.length}`);
+    }
+    if (platform) {
+      const platforms = platform.split(',').map((s) => s.trim()).filter(Boolean);
+      if (platforms.length > 0) {
+        params.push(platforms);
+        conditions.push(`o.platform = ANY($${params.length})`);
+      }
+    }
+
+    let statusCondition;
+    if (status === 'late') {
+      statusCondition = `(sl.shipped_at IS NOT NULL AND sl.shipped_at > o.ship_by_date)`;
+    } else if (status === 'overdue') {
+      statusCondition = `(sl.shipped_at IS NULL AND o.ship_by_date < NOW() AND o.status NOT IN ('shipped', 'delivered', 'cancelled'))`;
+    } else {
+      statusCondition = `(
+        (sl.shipped_at IS NOT NULL AND sl.shipped_at > o.ship_by_date)
+        OR
+        (sl.shipped_at IS NULL AND o.ship_by_date < NOW() AND o.status NOT IN ('shipped', 'delivered', 'cancelled'))
+      )`;
+    }
+
+    const extraWhere = conditions.length > 0 ? `AND ${conditions.join(' AND ')}` : '';
+
+    const baseFrom = `
+      FROM orders.orders o
+      LEFT JOIN (
+        SELECT DISTINCT ON (order_id) order_id, changed_at AS shipped_at
+        FROM orders.order_status_log
+        WHERE to_status = 'shipped'
+        ORDER BY order_id, changed_at ASC
+      ) sl ON sl.order_id = o.id
+      WHERE o.ship_by_date IS NOT NULL
+        AND ${statusCondition}
+        ${extraWhere}
+    `;
+
+    const countResult = await pool.query(`SELECT COUNT(*)::int AS total ${baseFrom}`, params);
+    const total = countResult.rows[0].total;
+
+    params.push(limitNum);
+    const limitParam = params.length;
+    params.push(offset);
+    const offsetParam = params.length;
+
+    const dataResult = await pool.query(`
+      SELECT
+        o.id AS order_id,
+        o.external_id,
+        o.platform,
+        o.customer_name,
+        o.ship_by_date,
+        sl.shipped_at AS actual_shipped_at,
+        CASE
+          WHEN sl.shipped_at IS NOT NULL AND sl.shipped_at > o.ship_by_date
+            THEN ROUND(EXTRACT(EPOCH FROM (sl.shipped_at - o.ship_by_date)) / 86400.0, 1)
+          WHEN sl.shipped_at IS NULL AND o.ship_by_date < NOW()
+            THEN ROUND(EXTRACT(EPOCH FROM (NOW() - o.ship_by_date)) / 86400.0, 1)
+        END AS days_late,
+        o.ship_node,
+        o.status AS current_status
+      ${baseFrom}
+      ORDER BY o.ship_by_date ASC
+      LIMIT $${limitParam} OFFSET $${offsetParam}
+    `, params);
+
+    res.json({
+      shipments: dataResult.rows,
+      total,
+      page: pageNum,
+      limit: limitNum,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /orders/reports/overdue
+// No date range — current state only.
+// Returns orders where ship_by_date < NOW() and status not in
+// (shipped, delivered, cancelled), sorted most overdue first.
+// ---------------------------------------------------------------------------
+router.get('/reports/overdue', async (req, res, next) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        o.id AS order_id,
+        o.external_id,
+        o.platform,
+        o.customer_name,
+        o.ship_by_date,
+        o.ship_node,
+        o.status AS current_status,
+        ROUND(EXTRACT(EPOCH FROM (NOW() - o.ship_by_date)) / 86400.0, 1) AS days_overdue
+      FROM orders.orders o
+      WHERE o.ship_by_date IS NOT NULL
+        AND o.ship_by_date < NOW()
+        AND o.status NOT IN ('shipped', 'delivered', 'cancelled')
+      ORDER BY o.ship_by_date ASC
+    `);
+
+    res.json({
+      count: result.rows.length,
+      orders: result.rows,
+    });
   } catch (err) {
     next(err);
   }
